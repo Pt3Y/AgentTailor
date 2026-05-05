@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 # Add project root to Python path
 _project_root = Path(__file__).parent.parent
@@ -36,8 +36,7 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "epn_dropout": None,
         "critic_weight_decay": None,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
-        "dataset_split": "val",
-        "validation_split": "test",
+        # Caps apply per file: dev.jsonl (train) vs test.jsonl (eval) — disjoint, no merge.
         "max_training_samples": 40,
         "max_validation_samples": 129,
     }
@@ -47,14 +46,10 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
 
 
 import asyncio
-import copy
 import random
 import time
 import numpy as np
 import torch
-from dataset.aqua_dataset import AQuADataset
-from experiments_util.soft_judge import Train4SoftJudge
-from AgentTailor.ATNetwork.edge_judge import EdgeJudge
 from AgentTailor.utils.globals import PromptTokens, CompletionTokens, Cost, ApiCalls
 
 SEED = 888
@@ -64,6 +59,19 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
+
+
+async def train_aqua_with_stage3_stats(**config: Any) -> Dict[str, Any]:
+    max_train = config.pop("max_training_samples", None)
+    max_eval = config.pop("max_validation_samples", None)
+    config.pop("dataset_split", None)
+    config.pop("validation_split", None)
+    return await train_base.train_all(
+        **config,
+        train_split_max_records=max_train,
+        eval_split_max_records=max_eval,
+    )
+
 
 def main() -> None:
 
@@ -88,69 +96,6 @@ def main() -> None:
     print(f"Cost: ${cost:.6f}")
     print("=" * 80)
 
-
-async def train_aqua_with_stage3_stats(**config: Any) -> Dict[str, Any]:
-
-    dataset_split = config.pop("dataset_split", "dev")
-    validation_split = config.pop("validation_split", "test")
-    max_training_samples = config.pop("max_training_samples", 40)
-    max_validation_samples = config.pop("max_validation_samples", 129)
-
-
-    original_init = AQuADataset.__init__
-
-    def patched_init(
-        self,
-        split: str = "test",
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-
-        if split == "test":
-
-            dev_ds = object.__new__(AQuADataset)
-            dev_kwargs = dict(kwargs)
-            dev_kwargs.setdefault("max_samples", max_training_samples)
-            original_init(
-                dev_ds,
-                split=dataset_split,
-                *args,
-                **dev_kwargs,
-            )
-
-
-            val_ds = object.__new__(AQuADataset)
-            val_kwargs = dict(kwargs)
-            val_kwargs.setdefault("max_samples", max_validation_samples)
-            original_init(
-                val_ds,
-                split=validation_split,
-                *args,
-                **val_kwargs,
-            )
-
-
-            self.records = list(dev_ds.records) + list(val_ds.records)
-            self._split = "dev+test"
-            print(
-                f"✅ Patched AQuADataset: {len(dev_ds.records)} train(dev) + "
-                f"{len(val_ds.records)} val(test) = {len(self.records)} total samples"
-            )
-            return
-
-
-        return original_init(self, split=split, *args, **kwargs)
-
-
-    AQuADataset.__init__ = patched_init
-
-    try:
-        result = await train_base.train_all(**config)
-    finally:
-
-        AQuADataset.__init__ = original_init
-
-    return result
 
 if __name__ == "__main__":
     try:

@@ -1861,6 +1861,9 @@ async def train_all(
         lambda3: Optional[float] = None,
         edge_judge: Optional[EdgeJudge] = None,
         node_kwargs: Optional[List[Dict[str, Any]]] = None,
+        train_split_max_records: Optional[int] = None,
+        eval_split_max_records: Optional[int] = None,
+        gsm8k_shuffle_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     resolved_epn_dims = list(epn_dims)
 
@@ -1902,30 +1905,60 @@ async def train_all(
     # Applied for: aqua/gsm8k/mmlu/multiarith/svamp
     if domain == "aqua":
         from dataset.aqua_dataset import AQuADataset
-        # AQuADataset: val -> dev.jsonl, test -> test.jsonl; train -> test.json (avoid). Use val for training.
-        train_dataset = AQuADataset(split="val")
-        test_dataset = AQuADataset(split="test")
+        # AQuADataset: val -> dev.jsonl, test -> test.jsonl (disjoint files; do not merge splits).
+        train_kw: Dict[str, Any] = {}
+        if train_split_max_records is not None:
+            train_kw["max_samples"] = train_split_max_records
+        eval_kw: Dict[str, Any] = {}
+        if eval_split_max_records is not None:
+            eval_kw["max_samples"] = eval_split_max_records
+        train_dataset = AQuADataset(split="val", **train_kw)
+        test_dataset = AQuADataset(split="test", **eval_kw)
         test_max_samples = 129
     elif domain == "mmlu":
         from experiments.train4mmlu import MMLUDataset
-        # MMLU wrapper only supports dev/val (not train/test)
-        train_dataset = MMLUDataset(split="dev")
-        test_dataset = MMLUDataset(split="val")
+        train_kw_m: Dict[str, Any] = {}
+        if train_split_max_records is not None:
+            train_kw_m["max_samples"] = train_split_max_records
+        eval_kw_m: Dict[str, Any] = {}
+        if eval_split_max_records is not None:
+            eval_kw_m["max_samples"] = eval_split_max_records
+        train_dataset = MMLUDataset(split="dev", **train_kw_m)
+        test_dataset = MMLUDataset(split="val", **eval_kw_m)
         test_max_samples = 153
     elif domain == "svamp":
         from dataset.svamp_dataset import SvampDataset
-        train_dataset = SvampDataset(split="train")
-        test_dataset = SvampDataset(split="test")
+        train_kw_s: Dict[str, Any] = {}
+        if train_split_max_records is not None:
+            train_kw_s["max_samples"] = train_split_max_records
+        eval_kw_s: Dict[str, Any] = {}
+        if eval_split_max_records is not None:
+            eval_kw_s["max_samples"] = eval_split_max_records
+        train_dataset = SvampDataset(split="train", **train_kw_s)
+        test_dataset = SvampDataset(split="test", **eval_kw_s)
         test_max_samples = 121
     elif domain == "multiarith":
         from dataset.multiarith_dataset import MultiArithDataset
-        train_dataset = MultiArithDataset(split="train")
-        test_dataset = MultiArithDataset(split="test")
+        train_kw_ma: Dict[str, Any] = {}
+        if train_split_max_records is not None:
+            train_kw_ma["max_samples"] = train_split_max_records
+        eval_kw_ma: Dict[str, Any] = {}
+        if eval_split_max_records is not None:
+            eval_kw_ma["max_samples"] = eval_split_max_records
+        train_dataset = MultiArithDataset(split="train", **train_kw_ma)
+        test_dataset = MultiArithDataset(split="test", **eval_kw_ma)
         test_max_samples = 121
     elif domain == "gsm8k":
         from experiments.train4gms8k import GSM8KDataset
-        train_dataset = GSM8KDataset(split="train")
-        test_dataset = GSM8KDataset(split="test")
+        gseed = int(gsm8k_shuffle_seed) if gsm8k_shuffle_seed is not None else 888
+        train_kw_g: Dict[str, Any] = {"seed": gseed}
+        eval_kw_g: Dict[str, Any] = {"seed": gseed}
+        if train_split_max_records is not None:
+            train_kw_g["max_samples"] = train_split_max_records
+        if eval_split_max_records is not None:
+            eval_kw_g["max_samples"] = eval_split_max_records
+        train_dataset = GSM8KDataset(split="train", **train_kw_g)
+        test_dataset = GSM8KDataset(split="test", **eval_kw_g)
         test_max_samples = 157
     else:
         # Default (e.g., HumanEval): strict split separation to avoid leakage.
@@ -1979,10 +2012,8 @@ async def train_all(
 
     if domain == "gsm8k":
         print(
-            "[INFO] GSM8K: train_all patches the Dataset - split='test' becomes train with "
-            "max_samples=max_training_samples (often matches Stage1+Stage2 count). "
-            "So test=a/b in parentheses is the Stage3 pool size (denominator often that cap), "
-            "not the official test split; train=.../161 uses Stage1+2 train default cap."
+            "[INFO] GSM8K: train split = shuffled jsonl train portion; Stage3 pool = shuffled test "
+            "portion (capped by eval_split_max_records / test_max_samples). No train/test merge."
         )
 
     actor_params = [actor.spatial_logits]

@@ -172,113 +172,90 @@ class GSM8KDataset:
 
 async def train_gsm8k_with_stage3_stats(**config: Any) -> Dict[str, Any]:
 
-
-    dataset_split = config.pop("dataset_split", "train")
+    config.pop("dataset_split", None)
     validation_split = config.pop("validation_split", "val")
-    max_training_samples = config.pop("max_training_samples", 40)
-    max_validation_samples = config.pop("max_validation_samples", 200)
+    max_training_samples = config.pop("max_training_samples", None)
+    max_validation_samples = config.pop("max_validation_samples", None)
     gsm8k_shuffle_seed = config.pop("gsm8k_shuffle_seed", None)
 
-    original_init = GSM8KDataset.__init__
+    result = await train_base.train_all(
+        **config,
+        train_split_max_records=max_training_samples,
+        eval_split_max_records=max_validation_samples,
+        gsm8k_shuffle_seed=gsm8k_shuffle_seed,
+    )
 
-    def patched_init(
-        self,
-        split: str = "test",
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
+    _vseed = int(gsm8k_shuffle_seed) if gsm8k_shuffle_seed is not None else 888
 
-        if gsm8k_shuffle_seed is not None:
-            kwargs.setdefault("seed", int(gsm8k_shuffle_seed))
-        if split == "test":
-            split = dataset_split
-            kwargs.setdefault("max_samples", max_training_samples)
-
-        elif split == validation_split:
-            kwargs.setdefault("max_samples", max_validation_samples)
-        return original_init(self, split=split, *args, **kwargs)
-
-    GSM8KDataset.__init__ = patched_init
-
-    try:
-
-        train_base.HumanEvalDataset = GSM8KDataset
-
-
-
-
-        result = await train_base.train_all(**config)
-
-        stage3_actor = result.get("stage3_actor") or result.get("actor")
-        if stage3_actor is None:
-            print("⚠️ Actor not found; skipping Stage 3 validation")
-            return result
-
-        val_dataset = GSM8KDataset(split=validation_split, max_samples=max_validation_samples)
-        total_val = len(val_dataset.records)
-        if total_val == 0:
-            print("⚠️ Validation set is empty; skipping Stage 3 validation")
-            return result
-
-        print("\n" + "=" * 80)
-        print(f"Stage 3 validation: using GSM8K {validation_split} split ({total_val} samples)")
-        print("=" * 80)
-
-
-        stage3_state = train_base.TrainingState()
-        stage3_state.reset_token_baseline()
-
-        for idx, record in enumerate(val_dataset.records):
-            print(f"\n====== Stage 3 validation sample {idx + 1}/{total_val} ======")
-            task_input = val_dataset.record_to_input(record)
-
-            answers, _, _ = await stage3_actor.arun(
-                task_input,
-                num_rounds=config.get("num_rounds", 3),
-                aggregate_mode="all connected",
-            )
-
-            final_answer = val_dataset.postprocess_answer(answers[-1] if answers else "")
-            pass_ratio, is_passing, feedback, test_state, unit_tests = val_dataset.evaluate_candidate(
-                final_answer,
-                record,
-            )
-
-            stage3_state.update(is_passing)
-
-            status = "✅" if is_passing else "❌"
-            print(f"Sample {idx + 1} result {status} | pass_ratio={pass_ratio:.2%}")
-            if (idx + 1) % 10 == 0:
-                print(
-                    f"  Current cumulative accuracy: {stage3_state.accuracy:.2%} "
-                    f"({stage3_state.cumulative_correct}/{stage3_state.cumulative_total})"
-                )
-
-        print("\n" + "=" * 80)
-        print("[Stage 3 validation cumulative statistics] (GSM8K validation set)")
-        print("=" * 80)
-        v_prompt, v_completion, v_total = stage3_state.get_token_stats()
-        print(
-            f"  Cumulative accuracy: {stage3_state.accuracy:.2%} "
-            f"({stage3_state.cumulative_correct}/{stage3_state.cumulative_total})"
-        )
-        print(
-            f"  Token stats: Prompt={v_prompt:,} | Completion={v_completion:,} | Total={v_total:,}"
-        )
-        print("=" * 80)
-
-
-        result["stage3_validation_accuracy"] = stage3_state.accuracy
-        result["stage3_validation_correct"] = stage3_state.cumulative_correct
-        result["stage3_validation_total"] = stage3_state.cumulative_total
-        result["stage3_validation_prompt_tokens"] = v_prompt
-        result["stage3_validation_completion_tokens"] = v_completion
-        result["stage3_validation_total_tokens"] = v_total
-
+    stage3_actor = result.get("stage3_actor") or result.get("actor")
+    if stage3_actor is None:
+        print("⚠️ Actor not found; skipping Stage 3 validation")
         return result
-    finally:
 
-        GSM8KDataset.__init__ = original_init
+    val_dataset = GSM8KDataset(
+        split=validation_split,
+        max_samples=max_validation_samples,
+        seed=_vseed,
+    )
+    total_val = len(val_dataset.records)
+    if total_val == 0:
+        print("⚠️ Validation set is empty; skipping Stage 3 validation")
+        return result
+
+    print("\n" + "=" * 80)
+    print(f"Stage 3 validation: using GSM8K {validation_split} split ({total_val} samples)")
+    print("=" * 80)
+
+    stage3_state = train_base.TrainingState()
+    stage3_state.reset_token_baseline()
+
+    for idx, record in enumerate(val_dataset.records):
+        print(f"\n====== Stage 3 validation sample {idx + 1}/{total_val} ======")
+        task_input = val_dataset.record_to_input(record)
+
+        answers, _, _ = await stage3_actor.arun(
+            task_input,
+            num_rounds=config.get("num_rounds", 3),
+            aggregate_mode="all connected",
+        )
+
+        final_answer = val_dataset.postprocess_answer(answers[-1] if answers else "")
+        pass_ratio, is_passing, feedback, test_state, unit_tests = val_dataset.evaluate_candidate(
+            final_answer,
+            record,
+        )
+
+        stage3_state.update(is_passing)
+
+        status = "✅" if is_passing else "❌"
+        print(f"Sample {idx + 1} result {status} | pass_ratio={pass_ratio:.2%}")
+        if (idx + 1) % 10 == 0:
+            print(
+                f"  Current cumulative accuracy: {stage3_state.accuracy:.2%} "
+                f"({stage3_state.cumulative_correct}/{stage3_state.cumulative_total})"
+            )
+
+    print("\n" + "=" * 80)
+    print("[Stage 3 validation cumulative statistics] (GSM8K validation set)")
+    print("=" * 80)
+    v_prompt, v_completion, v_total = stage3_state.get_token_stats()
+    print(
+        f"  Cumulative accuracy: {stage3_state.accuracy:.2%} "
+        f"({stage3_state.cumulative_correct}/{stage3_state.cumulative_total})"
+    )
+    print(
+        f"  Token stats: Prompt={v_prompt:,} | Completion={v_completion:,} | Total={v_total:,}"
+    )
+    print("=" * 80)
+
+    result["stage3_validation_accuracy"] = stage3_state.accuracy
+    result["stage3_validation_correct"] = stage3_state.cumulative_correct
+    result["stage3_validation_total"] = stage3_state.cumulative_total
+    result["stage3_validation_prompt_tokens"] = v_prompt
+    result["stage3_validation_completion_tokens"] = v_completion
+    result["stage3_validation_total_tokens"] = v_total
+
+    return result
 
 
 def main() -> None:

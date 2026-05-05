@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 # Add project root to Python path (allow running this file directly)
 _project_root = Path(__file__).parent.parent
@@ -36,9 +36,7 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "epn_dropout": None,
         "critic_weight_decay": None,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
-        "dataset_split": "train",
         "max_training_samples": 40,
-        "validation_split": "test",
         "max_validation_samples": 200,
     }
     if overrides:
@@ -47,14 +45,10 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
 
 
 import asyncio
-import copy
 import random
 import time
 import numpy as np
 import torch
-from dataset.multiarith_dataset import MultiArithDataset
-from experiments_util.soft_judge import Train4SoftJudge
-from AgentTailor.ATNetwork.edge_judge import EdgeJudge
 from AgentTailor.utils.globals import PromptTokens, CompletionTokens, Cost, ApiCalls
 
 SEED = 888
@@ -64,6 +58,7 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
+
 
 def main() -> None:
 
@@ -90,80 +85,19 @@ def main() -> None:
 
 
 async def train_multiarith_with_stage3_stats(**config: Any) -> Dict[str, Any]:
+    max_train = config.pop("max_training_samples", None)
+    max_eval = config.pop("max_validation_samples", None)
+    config.pop("dataset_split", None)
+    config.pop("validation_split", None)
+    return await train_base.train_all(
+        **config,
+        train_split_max_records=max_train,
+        eval_split_max_records=max_eval,
+    )
 
-    dataset_split = config.pop("dataset_split", "train")
-    validation_split = config.pop("validation_split", "test")
-    max_training_samples = config.pop("max_training_samples", 40)
-    max_validation_samples = config.pop("max_validation_samples", 200)
-
-
-    original_init = MultiArithDataset.__init__
-
-    def patched_init(
-        self,
-        split: str = "test",
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-
-        if split == "test":
-
-
-
-            train_ds = object.__new__(MultiArithDataset)
-            train_kwargs = dict(kwargs)
-            train_kwargs.setdefault("max_samples", max_training_samples)
-            train_kwargs.setdefault("seed", SEED)
-            original_init(
-                train_ds,
-                split=dataset_split,
-                *args,
-                **train_kwargs,
-            )
-
-
-            val_ds = object.__new__(MultiArithDataset)
-            val_kwargs = dict(kwargs)
-            val_kwargs.setdefault("max_samples", max_validation_samples)
-            val_kwargs.setdefault("seed", SEED)
-            original_init(
-                val_ds,
-                split=validation_split,
-                *args,
-                **val_kwargs,
-            )
-
-
-            self.records = list(train_ds.records) + list(val_ds.records)
-            self._split = "train+test"
-            print(
-                f"✅ Patched MultiArithDataset: {len(train_ds.records)} train + "
-                f"{len(val_ds.records)} val(test) = {len(self.records)} total samples"
-            )
-            return
-
-
-        return original_init(self, split=split, *args, **kwargs)
-
-
-    MultiArithDataset.__init__ = patched_init
-
-    try:
-
-
-
-        train_base.HumanEvalDataset = MultiArithDataset
-
-        result = await train_base.train_all(**config)
-
-        return result
-    finally:
-
-        MultiArithDataset.__init__ = original_init
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print("\n⚠️ MultiArith training interrupted by user.")
-

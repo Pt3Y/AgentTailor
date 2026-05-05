@@ -242,11 +242,16 @@ class MMLUDataset:
 
 async def train_mmlu_with_stage3_stats(**config) -> Dict[str, Any]:
 
-    train_config = {k: v for k, v in config.items()
-                    if k not in ["dataset_split", "max_training_samples", "max_validation_samples", "validation_split"]}
+    max_train = config.pop("max_training_samples", None)
+    max_eval = config.pop("max_validation_samples", None)
+    config.pop("dataset_split", None)
+    config.pop("validation_split", None)
 
-
-    result = await train_base.train_all(**train_config)
+    result = await train_base.train_all(
+        **config,
+        train_split_max_records=max_train,
+        eval_split_max_records=max_eval,
+    )
 
 
 
@@ -294,7 +299,6 @@ async def train_mmlu_with_stage3_stats(**config) -> Dict[str, Any]:
 
 
 def main() -> None:
-    train_base.HumanEvalDataset = MMLUDataset
     config = _build_config({"edge_judge": TextQJudge()})
     start_wall_clock = time.time()
     result = asyncio.run(train_mmlu_with_stage3_stats(**config))
