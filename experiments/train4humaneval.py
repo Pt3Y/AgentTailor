@@ -36,6 +36,7 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "epn_dropout": None,
         "critic_weight_decay": None,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
+        "stage2_logit_path": train_base.DEFAULT_STAGE2_LOGITS,
     }
     if overrides:
         config.update(overrides)
@@ -61,7 +62,7 @@ def main() -> None:
 
     config = _build_config()
     start_wall_clock = time.time()
-    result = asyncio.run(train_base.train_all(**_build_config()))
+    result = asyncio.run(train_base.train_all(**config))
 
     stage3_stats = result.get("stage3", {})
     stage3_correct = int(stage3_stats.get("stage3_correct", 0))

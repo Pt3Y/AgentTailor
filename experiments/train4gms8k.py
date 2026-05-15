@@ -42,10 +42,12 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "epn_dropout": None,
         "critic_weight_decay": None,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
+        "stage2_logit_path": train_base.DEFAULT_STAGE2_LOGITS,
         "dataset_split": "train",
         "max_training_samples": 40,
         "validation_split": "val",
         "max_validation_samples": 200,
+        "gsm8k_shuffle_seed": 888,
     }
     if overrides:
         config.update(overrides)
@@ -180,8 +182,8 @@ async def train_gsm8k_with_stage3_stats(**config: Any) -> Dict[str, Any]:
 
     result = await train_base.train_all(
         **config,
-        train_split_max_records=max_training_samples,
-        eval_split_max_records=max_validation_samples,
+        max_train_split_samples=max_training_samples,
+        max_test_split_samples=max_validation_samples,
         gsm8k_shuffle_seed=gsm8k_shuffle_seed,
     )
 

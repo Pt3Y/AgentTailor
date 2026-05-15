@@ -13,7 +13,7 @@ This repository is an experimental fork focused on **training / ablation** aroun
 | `experiments/` | Entry scripts (`train4*.py`) and `train_base.py` |
 | `dataset/` | Datasets and loaders (AQuA, GSM8K, MMLU, HumanEval, etc.) |
 | `experiments_util/` | Judges, loaders, helpers for experiments |
-| `.env.template` | Copy to `.env` and fill API keys / base URLs |
+| `.env.template` | **API only**: copy to `.env` and set keys / base URLs for your LLM provider |
 
 Generated runs, caches, and local secrets should stay out of git (see `.gitignore`).
 
@@ -21,42 +21,52 @@ Generated runs, caches, and local secrets should stay out of git (see `.gitignor
 
 ## Quick start
 
-**Before you run anything, pick the entry script for your domain and edit hyperparameters there.**
+**1. Training hyperparameters (required before any run)**  
 
-1. **Where to tune hyperparameters**  
-   - Open the matching file under `experiments/`, for example `experiments/train4aqua.py`, `experiments/train4gms8k.py`, `experiments/train4humaneval.py`, `experiments/train4mmlu.py`, `experiments/train4multiarith.py`, or `experiments/train4svamp.py`.  
-   - In each file, adjust the dict returned by **`_build_config()`** (learning rates, sample caps, `llm_name`, `agent_names`, `epn_dims`, `optimized_spatial` / `optimized_temporal`, domain flags, etc.).  
-   - Fields may be `None`; those are replaced inside **`experiments/train_base.py`** in **`train_all()`** with built-in defaults. Change defaults globally there only if you intend to affect every domain script.
+- **All** optimization / training knobs (`lr_*`, stage sample counts, virtual steps, dropout, etc.) are set **only** in each script’s **`_build_config()`** (e.g. `experiments/train4aqua.py`).  
+- **`train_base.train_all()` does not read training hyperparameters from environment variables.** If any required field is left as `None`, `train_all` raises a clear error telling you to set it in `_build_config()`.  
+- Each `train4*.py` ships a small block **`_TRAIN_NUMERIC_EXAMPLE`** with **non–paper-tuned example numbers** for a cheap smoke run. **Replace them** with your own settings before serious experiments or publication-related runs.  
+- Optional: `lambda3` (adaptive actor LR in real steps) may stay `None` if you do not use that path.  
+- Architecture-only default: if `epn_dims` is omitted, `train_all` may fill a minimal shape from `epn_concat_input_dim()` / `epn_head_hidden_sizes()`; you can still override `epn_dims` in `_build_config()`.
 
-2. **Python** 3.10+ recommended.
+**2. Python** 3.10+ recommended.
 
-3. **Install dependencies**
+**3. Install dependencies**
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements.txt
+```
 
-4. **Environment variables**  
-   Copy `.env.template` to `.env` and set at least:
+**4. API credentials (`.env` — not training hyperparameters)**  
 
-   - `OPENAI_API` (and `OPENAI_BASE_URL` if you use a proxy or Azure-compatible endpoint)  
-   - or DeepSeek variables if you use that stack.
+Copy `.env.template` to `.env` and set only what your LLM client needs, for example:
 
-5. **Run an experiment** (from the repo root), e.g.:
+- `OPENAI_API` (and `OPENAI_BASE_URL` if you use a proxy or compatible gateway)  
+- or `DEEPSEEK_*` variables if you use that stack  
 
-   ```bash
-   python experiments/train4aqua.py
-   ```
+Do **not** put learning rates, sample counts, or other training knobs in `.env`; put them in `_build_config()` as above.
 
-   Other domains:
+**5. Run an experiment** (from the repo root), e.g.:
 
-   - `python experiments/train4gms8k.py`
-   - `python experiments/train4humaneval.py`
-   - `python experiments/train4mmlu.py`
-   - `python experiments/train4multiarith.py`
-   - `python experiments/train4svamp.py`
+```bash
+python experiments/train4aqua.py
+```
 
-Each script builds a config dict via `_build_config()` and calls `train_base.train_all(**config)` — use **keyword unpacking**, not a single dict positional argument. Optional: `_build_config(overrides={...})` where the script supports it.
+Other entry points: `train4gms8k.py`, `train4humaneval.py`, `train4mmlu.py`, `train4multiarith.py`, `train4svamp.py`.
+
+Each script builds a dict with `_build_config()` and calls `train_base.train_all(**...)` — use **keyword unpacking** from that dict (plus any extra kwargs the wrapper adds, e.g. dataset size caps).
+
+### `_build_config()` keys you should understand
+
+| Area | Typical keys |
+|------|----------------|
+| Model / graph | `agent_names`, `llm_name`, `decision_method`, `optimized_spatial`, `optimized_temporal`, `epn_dims`, `num_rounds` |
+| Optimizers / loss | `lr_actor`, `lr_critic`, `sparsity_weight`, `critic_weight_decay`, `lambda2`, `lambda3` |
+| Stages | `stage1_sample_count`, `stage2_sample_count`, `stage2_virtual_steps`, `stage3_virtual_steps`, `stage3_prune_ratio` |
+| Critics / EPN | `lock_threshold`, `temperature`, `epn_dropout` |
+| Data caps (where used) | `max_training_samples`, `max_validation_samples`; GSM8K also `gsm8k_shuffle_seed` |
+
+Domain-specific wrappers may `pop()` extra keys (e.g. `dataset_split`) before calling `train_all` so only supported arguments are passed.
 
 ---
 
@@ -64,5 +74,3 @@ Each script builds a config dict via `_build_config()` and calls `train_base.tra
 
 - Some splits ship under `dataset/` (e.g. AQuA JSONL, GSM8K, HumanEval, MultiArith, Svamp).
 - **MMLU** and other large corpora may be missing until you download them; use helpers such as `dataset/MMLU/download.py` and follow any README or comments in that folder.
-
-

@@ -6,6 +6,7 @@ import copy
 import os
 import sys
 import random
+import functools
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -19,6 +20,7 @@ if str(_project_root) not in sys.path:
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 
 from AgentTailor.ATNetwork.Actor import Actor
@@ -27,10 +29,15 @@ from AgentTailor.ATNetwork.edge_judge import EdgeJudge
 from dataset.humaneval_dataset import HumanEvalDataset
 from experiments_util.soft_judge import Train4SoftJudge
 from experiments_util.textqa_edge_judge import TextQEdgeJudge
+from experiments_util.mmlu_edge_judge import MMLUEdgeJudge
 from experiments_util.edge_utils import prepare_edge_inputs
 from AgentTailor.utils.globals import PromptTokens, CompletionTokens, Cost, ApiCalls
+device = "cuda" if torch.cuda.is_available() else "cpu"
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ARTIFACTS_DIR = os.path.join(PROJECT_ROOT, "artifacts")
+DEFAULT_STAGE2_LOGITS_PATH = os.path.join(ARTIFACTS_DIR, "train11_stage2_logits.pt")
+# Shorter alias used by train4 *_build_config (same path as DEFAULT_STAGE2_LOGITS_PATH).
+DEFAULT_STAGE2_LOGITS = DEFAULT_STAGE2_LOGITS_PATH
 
 
 def epn_concat_input_dim(n_segments: int = 5, embed_dim: int = 384) -> int:
@@ -298,7 +305,7 @@ def _critic_build_edge_batch(
     List[str],
     torch.Tensor,
 ]:
-    """Build Critic edge-batch inputs and Δ targets (expanded_subset is edges in one batch)."""
+    """为 Critic 构造一批边的输入张量与 Δ 目标（expanded_subset 为一条批次内的边列表）。"""
     in_node_description_list: List[str] = []
     in_node_history_list: List[str] = []
     query_list: List[str] = []
@@ -339,8 +346,9 @@ def _critic_build_edge_batch(
 def _critic_loss_from_batch(
     critic_predictions: torch.Tensor,
     critic_targets: torch.Tensor,
+    expanded_subset: List[Dict[str, Any]],
 ) -> torch.Tensor:
-    """Same total Critic loss as in real_execution (within one batch): weighted MSE only."""
+    device = critic_predictions.device
     delta_flat = critic_targets.view(-1)
     pred_flat = critic_predictions.view(-1)
     sq_error_flat = (pred_flat - delta_flat) ** 2
@@ -371,11 +379,44 @@ def _critic_loss_from_batch(
     if misclassified_neg_mask.any():
         class_weight[misclassified_neg_mask] = class_weight[misclassified_neg_mask] * beta_mis_neg
 
-    return (sq_error_flat * class_weight).mean()
+    mis_neg_hinge = torch.tensor(0.0, device=device)
+    if neg_mask.any():
+        pred_neg = pred_flat[neg_mask]
+        mis_neg_hinge = torch.clamp(pred_neg - neg_mis_margin, min=0.0).mean()
+
+    mse_loss = (sq_error_flat * class_weight).mean()
+
+    ranking_loss = _compute_ranking_loss(
+        predictions=critic_predictions,
+        targets=critic_targets,
+        edge_details=expanded_subset,
+        margin=0.3,
+    )
+
+    margin_pos = 0.05
+    margin_neutral = 0.02
+    pos_mask = delta_flat > tau_pos
+    neg_mask = delta_flat < -tau_pos
+    neutral_mask = (~pos_mask) & (~neg_mask)
+
+    bucket_terms = []
+    if pos_mask.any():
+        pos_violation = torch.clamp(margin_pos - pred_flat[pos_mask], min=0.0) * 2.0
+        bucket_terms.append(pos_violation)
+    if neg_mask.any():
+        neg_violation = torch.clamp(margin_pos + pred_flat[neg_mask], min=0.0) * 2.0
+        bucket_terms.append(neg_violation)
+    if neutral_mask.any():
+        neu_violation = torch.clamp(pred_flat[neutral_mask].abs() - margin_neutral, min=0.0)
+        bucket_terms.append(neu_violation)
+    critic_loss = (
+        mse_loss
+    )
+    return critic_loss
 
 
 def _persist_stage3_curves_json(dataset_name: str, stats: Dict[str, Any]) -> None:
-    """Write Stage3 MSE and Critic loss curves to artifacts (persists progress if interrupted)."""
+    """将 Stage3 的 MSE 与 Critic 记录损失曲线写入 artifacts（供中断后仍保留已跑样本）。"""
     import json
 
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
@@ -390,15 +431,13 @@ def _persist_stage3_curves_json(dataset_name: str, stats: Dict[str, Any]) -> Non
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-
-# Count Stage3 per-sample MSE (mean over all edges) samples below this threshold; used in logs
 STAGE3_MSE_LOW_THRESHOLD = 0.015
 
 
 def _stage3_mse_low_count(
     mse_list: List[float], threshold: float = STAGE3_MSE_LOW_THRESHOLD
 ) -> Tuple[int, int]:
-    """Return (count with MSE<=threshold, total count)."""
+    """返回 (MSE<=threshold 的样本数, 总样本数)。"""
     if not mse_list:
         return 0, 0
     n_ok = sum(1 for x in mse_list if float(x) <= threshold)
@@ -408,10 +447,6 @@ def _stage3_mse_low_count(
 def _epn_edge_correlation_metrics(
     y_true: np.ndarray, y_pred: np.ndarray
 ) -> Dict[str, float]:
-    """
-    Edge-level Δ_true vs Δ_pred: Pearson / Spearman / R² / MSE on pooled Stage2/Stage3 edges.
-    Spearman is more robust for monotone relationships; compare with Pearson.
-    """
     y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
     n = int(y_true.size)
@@ -490,7 +525,7 @@ def _compute_real_deltas(
             detail = edge_details[idx]
 
 
-            # avg_incoming: average over other incoming edges to the same in_node_id
+            # avg_incoming 应该基于“同一个接收节点(in_node_id)”的其他入边计算
             incoming_idx_to_source = incoming_groups[(round_idx, detail["in_node_id"])]
             if len(incoming_idx_to_source) > 1:
                 total = sum(edge_details[i]["soft_score"] for i in incoming_idx_to_source) - detail["soft_score"]
@@ -507,30 +542,15 @@ def _compute_real_deltas(
         round_size = len(indices)
 
         if round_total < -EPS:
-            print(
-                f"  WARNING: Round {round_idx}: round_total={round_total:.6f} < 0; "
-                f"abs-normalization may cause reward sign issues"
-            )
+            print()
         for idx in indices:
             detail = edge_details[idx]
             delta = detail.get("delta", 0.0)
             reward = 0.0
             if abs(round_total) > EPS:
-
-
-
                 reward = delta / (abs(round_total) + EPS)
             detail["reward"] = reward
             round_reward_records[round_idx].append((idx, reward))
-
-
-
-
-
-
-
-
-
 
     for round_idx, reward_pairs in round_reward_records.items():
         for idx, _ in reward_pairs:
@@ -582,7 +602,6 @@ def _compute_reward_from_deltas(
 
     return round_total_delta
 
-
 def _policy_loss_from_rewards(
         actor: Actor,
         edge_details: List[Dict[str, Any]],
@@ -597,10 +616,9 @@ def _policy_loss_from_rewards(
         penalize_unselected_edges: bool = True,
         penalize_all_potential_edges: bool = True,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]], Set[Tuple[str, str, str]]]:
-    dev = actor.spatial_logits.device
 
     if not edge_details and not (is_correct and selected_keys is not None):
-        return torch.tensor(0.0, device=dev), [], set()
+        return torch.tensor(0.0, device=device), [], set()
 
     edge_reward_map: Dict[Tuple[str, str, str], float] = defaultdict(float)
     edge_raw_delta_map: Dict[Tuple[str, str, str], float] = defaultdict(float)
@@ -643,8 +661,11 @@ def _policy_loss_from_rewards(
     for (out_id, in_id, edge_type), reward in edge_reward_map.items():
         if (out_id, in_id, edge_type) not in selected_keys_set:
             continue
+
+
         raw_delta = edge_raw_delta_map.get((out_id, in_id, edge_type), 0.0)
         if raw_delta <= 0.0:
+
             negative_utility_keys.add((out_id, in_id, edge_type))
 
         if abs(reward) < EPS:
@@ -677,11 +698,9 @@ def _policy_loss_from_rewards(
         else UNSELECTED_PENALTY * max(1, num_rounds)
     )
 
-    # Whether unselected edges contribute penalty terms (virtual paths may disable)
     if penalize_unselected_edges:
         penalty_keys.update(unselected_keys_set)
 
-    # Whether all potential edges are penalized (on for real execution; often off for virtual)
     if penalize_all_potential_edges:
         for edge in actor.potential_spatial_edges:
             key = _edge_key(edge[0], edge[1], "spatial")
@@ -716,16 +735,19 @@ def _policy_loss_from_rewards(
         )
 
     if not log_terms:
-        print("WARNING: _policy_loss_from_rewards has no log_terms!")
-        print(f"  - selected_keys_set size: {len(selected_keys_set)}")
-        print(f"  - unselected_keys_set size: {len(unselected_keys_set)}")
-        print(f"  - negative_utility_keys size: {len(negative_utility_keys)}")
-        print(f"  - penalty_keys size: {len(penalty_keys)}")
-        print(f"  - handled_keys size: {len(handled_keys)}")
-        return torch.tensor(0.0, device=dev), edge_logs, set(edge_reward_map.keys())
-    log_terms_tensor = torch.stack(log_terms)
 
+        return torch.tensor(0.0, device=device), edge_logs, set(edge_reward_map.keys())
+
+    log_terms_tensor = torch.stack(log_terms)
     policy_loss = -log_terms_tensor.mean()
+
+    selected_log_terms = []
+    penalty_log_terms = []
+    for i, log in enumerate(edge_logs):
+        if log.get("reward", 0) != -float(penalty_scale):
+            selected_log_terms.append(log_terms_tensor[i].item())
+        else:
+            penalty_log_terms.append(log_terms_tensor[i].item())
 
     return policy_loss, edge_logs, set(edge_reward_map.keys())
 
@@ -866,6 +888,89 @@ def _print_actor_edge_info(
         )
 
 
+def _print_edge_utilities(edge_details: List[Dict[str, Any]], actor: Actor) -> None:
+    print("\nEdge utility summary")
+    if not edge_details:
+        print("No edge records.")
+        return
+
+    utility_map: Dict[Tuple[str, str, str], float] = defaultdict(float)
+    for detail in edge_details:
+        key = (
+            detail.get("out_node_id", ""),
+            detail.get("in_node_id", ""),
+            detail.get("type", ""),
+        )
+
+        reward_val = float(detail.get("reward_clamped", detail.get("reward", 0.0)) or 0.0)
+        utility_map[key] += reward_val
+
+    sorted_items = sorted(utility_map.items(), key=lambda kv: kv[1], reverse=True)
+    header = f"{'out_node_role':<22}{'in_node_role':<22}{'type':<10}{'utility':>12}"
+    print(header)
+    print("=" * len(header))
+    for (out_id, in_id, edge_type), utility in sorted_items:
+        out_role = _get_role(actor, out_id)
+        in_role = _get_role(actor, in_id)
+        print(f"{out_role:<22}{in_role:<22}{edge_type:<10}{utility:>12.4f}")
+
+
+def _print_critic_round_info(
+        edge_details: List[Dict[str, Any]],
+        actor: Actor,
+        real_round_totals: Optional[Dict[int, float]] = None,
+        critic_round_totals: Optional[Dict[int, float]] = None,
+) -> None:
+    print("\nCritic:")
+    if not edge_details:
+        print("No edge records.")
+        return
+
+    round_to_edges: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for detail in edge_details:
+        round_to_edges[int(detail.get("round", 0))].append(detail)
+
+    for round_idx in sorted(round_to_edges.keys()):
+        print(f"round{round_idx}:")
+        header = (
+            f"{'in_node_role':<22}{'out_node_role':<22}"
+            f"{'real(Δ/Δall)':>20}{'Critic(Δ/critic(Δ)_all)':>28}{'real_Δ':>12}{'critic_Δ':>12}"
+        )
+        print(header)
+        print("=" * len(header))
+        real_total = real_round_totals.get(round_idx) if real_round_totals else None
+        critic_total = critic_round_totals.get(round_idx) if critic_round_totals else None
+        real_sum = 0.0 if real_total is not None and abs(real_total) > EPS else None
+        critic_sum = 0.0 if critic_total is not None and abs(critic_total) > EPS else None
+        for detail in round_to_edges[round_idx]:
+            in_role = _get_role(actor, detail.get("in_node_id", ""))
+            out_role = _get_role(actor, detail.get("out_node_id", ""))
+            real_ratio = detail.get("real_ratio") if real_total is not None else None
+            critic_ratio = detail.get("critic_ratio") if critic_total is not None else None
+            real_delta = detail.get("delta", 0.0)
+            critic_delta = detail.get("critic_pred", 0.0)
+            real_str = f"{real_ratio:>20.4f}" if isinstance(real_ratio, (int, float)) else f"{'--':>20}"
+            critic_str = f"{critic_ratio:>28.4f}" if isinstance(critic_ratio, (int, float)) else f"{'--':>28}"
+            real_delta_str = f"{real_delta:>12.6f}" if isinstance(real_delta, (int, float)) else f"{'--':>12}"
+            critic_delta_str = f"{critic_delta:>12.6f}" if isinstance(critic_delta, (int, float)) else f"{'--':>12}"
+            print(f"{in_role:<22}{out_role:<22}{real_str}{critic_str}{real_delta_str}{critic_delta_str}")
+            if real_sum is not None and isinstance(real_ratio, (int, float)):
+                real_sum += real_ratio
+            if critic_sum is not None and isinstance(critic_ratio, (int, float)):
+                critic_sum += critic_ratio
+        summary_parts = []
+        if real_total is not None:
+            summary_parts.append(f"real_total_Δ={real_total:.6f}")
+        if critic_total is not None:
+            summary_parts.append(f"critic_total_Δ={critic_total:.6f}")
+        if real_sum is not None:
+            summary_parts.append(f"real_sum={real_sum:.6f}")
+        if critic_sum is not None:
+            summary_parts.append(f"critic_sum={critic_sum:.6f}")
+        if summary_parts:
+            print("  -> " + " | ".join(summary_parts))
+
+
 def _log_sample(
         label: str,
         record_name: str,
@@ -955,7 +1060,6 @@ async def real_execution(
 
     task_input = dataset.record_to_input(record)
     task_text = task_input.get("task", "")
-    device = actor.spatial_logits.device
 
     answers, _, edge_records = await actor.arun(
         task_input,
@@ -986,7 +1090,6 @@ async def real_execution(
     )
 
     if not edge_details:
-        # Track pass/fail per sample; eval_only must update too or Stage3 cumulative/stage3_correct stay 0
         training_state.update(is_passing)
         if verbose:
             _log_sample(
@@ -1038,18 +1141,12 @@ async def real_execution(
             "round_totals": dict(round_totals),
         }
 
-    if critic_optimizer is None:
-        raise ValueError("real_execution requires critic_optimizer when eval_only=False")
 
     selected_keys = {_edge_key(d["out_node_id"], d["in_node_id"], d["type"]) for d in edge_details}
 
-    # ========= Critic only: add unselected edges as weak supervision (some negative, some near-zero) =========
     critic_edge_details: List[Dict[str, Any]] = list(edge_details)
 
     def _make_extra_detail(out_id: str, in_id: str, edge_type: str) -> Dict[str, Any]:
-        # Avoid labeling every unselected edge as strongly negative; randomly mark some neutral (0.0)
-        # - delta=-0.1: edge optional / mildly harmful
-        # - delta=0.0 : edge has little effect
         extra_delta = -0.1 if (random.random() < 0.7) else 0.0
         return {
             "out_node_id": out_id,
@@ -1060,7 +1157,6 @@ async def real_execution(
             "selected": False,
         }
 
-    # Add every unselected spatial/temporal edge as Critic training samples
     for out_id, in_id in actor.potential_spatial_edges:
         key = _edge_key(out_id, in_id, "spatial")
         if key not in selected_keys:
@@ -1070,12 +1166,9 @@ async def real_execution(
         if key not in selected_keys:
             critic_edge_details.append(_make_extra_detail(out_id, in_id, "temporal"))
 
-    # Downsample extra -0.1 negatives so they do not swamp evaluated edges
     extra_start_idx = len(edge_details)
     total_extra = len(critic_edge_details) - extra_start_idx
     if total_extra > 0:
-        # Lower extra-negative keep ratio (was 0.5, now 0.3) to balance class distribution
-        # Fewer synthetic negatives after penalty weights were reduced
         keep_ratio = 0.3
         max_extra = min(total_extra, max(1, int(len(edge_details) * keep_ratio)))
         if total_extra > max_extra:
@@ -1086,23 +1179,16 @@ async def real_execution(
                 if idx < extra_start_idx or idx in keep_extra:
                     filtered.append(d)
             critic_edge_details = filtered
-
-    # ========= Sample Critic training edges (no multiplicative oversampling) =========
     expanded_edge_details: List[Dict[str, Any]] = []
-    # Index mapping for original edge_details only; extras are not written back to edge_details
     orig_to_expanded: List[List[int]] = [[] for _ in range(len(edge_details))]
     for i, d in enumerate(critic_edge_details):
-        # One copy per edge; no multiplicative replication for negative/zero targets
         idx = len(expanded_edge_details)
         expanded_edge_details.append(dict(d))
         if i < len(edge_details):
             orig_to_expanded[i].append(idx)
-
-    # ========= Critic: forward/backward per communication round; curves use loss / num_edges =========
     round_to_indices: Dict[int, List[int]] = defaultdict(list)
     for idx, d in enumerate(expanded_edge_details):
         round_to_indices[int(d.get("round", 0))].append(idx)
-
     per_round_loss_div_edges: List[float] = []
     for round_idx in sorted(round_to_indices.keys()):
         idxs = round_to_indices[round_idx]
@@ -1120,7 +1206,7 @@ async def real_execution(
             out_node_history_list=out_h,
             use_locked=False,
         ).to(device)
-        critic_loss_r = _critic_loss_from_batch(pred, tgt)
+        critic_loss_r = _critic_loss_from_batch(pred, tgt, subset)
         n_edges_r = max(1, len(subset))
         per_round_loss_div_edges.append(float(critic_loss_r.detach().cpu()) / float(n_edges_r))
 
@@ -1129,14 +1215,7 @@ async def real_execution(
         torch.nn.utils.clip_grad_norm_(critics.epn.parameters(), max_norm=1.0)
         critic_optimizer.step()
 
-    # Recorded loss: mean over rounds of (loss / edges_in_round); 0 if no rounds
-    critic_loss_recorded = (
-        float(sum(per_round_loss_div_edges) / len(per_round_loss_div_edges))
-        if per_round_loss_div_edges
-        else 0.0
-    )
 
-    # Second forward over all edges (no grad) for Actor/logging with latest Critic weights
     with torch.no_grad():
         in_d, in_h, q_l, out_d, out_h, critic_targets = _critic_build_edge_batch(
             expanded_edge_details, actor, task_text, device
@@ -1150,7 +1229,6 @@ async def real_execution(
             use_locked=False,
         ).to(device)
 
-    # Aggregate expanded-batch preds back to original edge_details (mean over duplicates)
     critic_preds_expanded = critic_predictions.view(-1)
     for i, detail in enumerate(edge_details):
         idx_list = orig_to_expanded[i]
@@ -1248,11 +1326,9 @@ async def real_execution(
         "pass_ratio": pass_ratio,
         "execution_time": sample_execution_time,
         "edge_logs": log_edges,
-        # For train-set correlation stats (per-edge preds/targets)
         "critic_pred_values": critic_predictions.detach().view(-1).cpu().tolist(),
         "critic_target_values": critic_targets.detach().view(-1).cpu().tolist(),
     }
-
 
 async def virtual_execution(
         record: Dict[str, Any],
@@ -1329,7 +1405,6 @@ async def virtual_execution(
         out_node_id = d.get("out_node_id", "")
         in_node_id = d.get("in_node_id", "")
 
-
         node_info = actor.get_edge_node_info_with_history(
             out_node_id=out_node_id,
             in_node_id=in_node_id,
@@ -1337,7 +1412,6 @@ async def virtual_execution(
             include_prompt=True,
             max_history_len=MAX_EDGE_HISTORY_LEN,
         )
-
         in_node_description_list.append(node_info["in_node"]["description"])
         in_node_history_list.append(node_info["in_node"]["history"])
         query_list.append(task_text)
@@ -1429,6 +1503,8 @@ async def stage1_training(
         num_rounds: int,
         sparsity_weight: float,
         training_state: TrainingState,
+        show_timing: bool = True,
+        show_progress: bool = True,
 ) -> Dict[str, List[float]]:
     stats = {"actor_loss": [], "critic_loss": [], "accuracy": []}
     spatial_edge_map = {(e[0], e[1]): idx for idx, e in enumerate(actor.potential_spatial_edges)}
@@ -1485,13 +1561,14 @@ async def stage2_training(
         virtual_steps_per_sample: int,
         lambda2: float,
         training_state: TrainingState,
+        show_timing: bool = True,
+        show_progress: bool = True,
 ) -> Dict[str, List[float]]:
     stats = {
         "virtual_actor_loss": [],
         "real_actor_loss": [],
         "real_critic_loss": [],
         "accuracy": [],
-        # Train-set correlation: Stage2 real_execution edge-level (pred, target)
         "train_pred_values": [],
         "train_target_values": [],
     }
@@ -1650,6 +1727,8 @@ async def stage3_training(
         stage3_temporal_masks_snapshot: Optional[torch.Tensor] = None,
         stage3_spatial_logits_snapshot: Optional[torch.Tensor] = None,
         stage3_temporal_logits_snapshot: Optional[torch.Tensor] = None,
+        show_timing: bool = True,
+        show_progress: bool = True,
         dataset_name: str = "",
 ) -> Dict[str, List[float]]:
     if stage3_virtual_steps is None:
@@ -1663,12 +1742,8 @@ async def stage3_training(
         "real_actor_loss": [],
         "real_critic_loss": [],
         "accuracy": [],
-        # Stage3 per-sample evaluation of Critic(EPN) quality:
-        # MSE between predicted Δ and true Δ (edge-level, averaged per sample).
         "stage3_mse": [],
-        # Matches curves/JSON: Critic loss from real_execution (mean over rounds of loss/edges)
         "stage3_critic_loss": [],
-        # Pooled edge-level pred/target across Stage3 for Pearson/Spearman (compare to Stage2)
         "stage3_pred_values": [],
         "stage3_target_values": [],
     }
@@ -1677,11 +1752,6 @@ async def stage3_training(
     stage_state = training_state or TrainingState()
 
     total = len(records)
-    if total > 0 and (not critics.is_locked or critics.locked_epn is None):
-        raise RuntimeError(
-            "stage3_training requires lock_critic() before Stage3 (frozen EPN + locked copy)."
-        )
-    # With Stage3 samples: reset token/cost/API counters and realign TrainingState baseline
     if total > 0:
         PromptTokens.instance().reset()
         CompletionTokens.instance().reset()
@@ -1706,9 +1776,6 @@ async def stage3_training(
                 if temporal_param is not None:
                     temporal_param.copy_(stage3_temporal_logits_snapshot.to(temporal_param.device))
 
-
-        # Stage3 is evaluation-only to avoid any train/test leakage:
-        # no virtual updates and no additional pruning on evaluation samples.
         try:
             result = await real_execution(
                 record=record,
@@ -1813,7 +1880,6 @@ async def stage3_training(
         stage3_completion_tokens = int(CompletionTokens.instance().value) - stage3_token_baseline_completion
         stage3_total_tokens = stage3_prompt_tokens + stage3_completion_tokens
 
-        # Align with stats["accuracy"] per item (not cumulative diffs) to match eval path
         acc_list = stats.get("accuracy", [])
         stage3_correct = sum(1 for x in acc_list if float(x) >= 0.5)
         stage3_total = len(acc_list)
@@ -1835,37 +1901,97 @@ async def stage3_training(
     return stats
 
 
+def _close_blueshirt_http_after(coro_fn):
+    """在 train_all 正常返回或抛错后关闭 BlueShirt 全局 aiohttp 会话，避免 Unclosed client session / SSL transport 噪声。"""
+
+    @functools.wraps(coro_fn)
+    async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await coro_fn(*args, **kwargs)
+        finally:
+            try:
+                from AgentTailor.llm.blueshirt_chat import close_blueshirt_session
+
+                await close_blueshirt_session()
+            except Exception:
+                pass
+
+    return _wrapper
+
+
+@_close_blueshirt_http_after
 async def train_all(
-        *,
-        agent_names: List[str],
-        llm_name: str,
-        decision_method: str,
-        optimized_spatial: bool,
-        optimized_temporal: bool,
-        domain: str,
-        num_rounds: int,
-        lr_actor: float,
-        lr_critic: float,
-        sparsity_weight: float,
-        stage1_sample_count: int,
-        stage2_sample_count: int,
-        stage2_virtual_steps: int,
-        lambda2: float,
-        stage3_virtual_steps: int,
-        stage3_prune_ratio: float,
-        lock_threshold: float,
-        temperature: float,
-        epn_dropout: float,
-        critic_weight_decay: float,
-        epn_dims: List[int],
+        agent_names: Optional[List[str]] = None,
+        llm_name: str = "DeepSeekChat",
+        decision_method: str = "FinalRefer",
+        optimized_spatial: bool = True,
+        optimized_temporal: bool = True,
+        domain: str = "humaneval",
+        num_rounds: int = 3,
+        lr_actor: Optional[float] = None,
+        lr_critic: Optional[float] = None,
+        sparsity_weight: Optional[float] = None,
+        stage1_sample_count: Optional[int] = None,
+        stage2_sample_count: Optional[int] = None,
+        stage2_virtual_steps: Optional[int] = None,
+        lambda2: Optional[float] = None,
         lambda3: Optional[float] = None,
         edge_judge: Optional[EdgeJudge] = None,
+        stage2_logit_path: Optional[str] = None,
+        stage3_virtual_steps: Optional[int] = None,
+        stage3_prune_ratio: Optional[float] = None,
         node_kwargs: Optional[List[Dict[str, Any]]] = None,
-        train_split_max_records: Optional[int] = None,
-        eval_split_max_records: Optional[int] = None,
+        show_timing: bool = True,
+        show_progress: bool = True,
+        epn_dims: Optional[List[int]] = None,
+        lock_threshold: Optional[float] = None,
+        temperature: Optional[float] = None,
+        epn_dropout: Optional[float] = None,
+        critic_weight_decay: Optional[float] = None,
+        max_train_split_samples: Optional[int] = None,
+        max_test_split_samples: Optional[int] = None,
         gsm8k_shuffle_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    resolved_epn_dims = list(epn_dims)
+    # All training hyperparameters must be passed from experiments/train4*.py::_build_config().
+    # They are never read from environment variables.
+    _required_floats: Tuple[Tuple[str, Optional[float]], ...] = (
+        ("lr_actor", lr_actor),
+        ("lr_critic", lr_critic),
+        ("sparsity_weight", sparsity_weight),
+        ("lambda2", lambda2),
+        ("stage3_prune_ratio", stage3_prune_ratio),
+        ("lock_threshold", lock_threshold),
+        ("temperature", temperature),
+        ("epn_dropout", epn_dropout),
+        ("critic_weight_decay", critic_weight_decay),
+    )
+    _required_ints: Tuple[Tuple[str, Optional[int]], ...] = (
+        ("stage1_sample_count", stage1_sample_count),
+        ("stage2_sample_count", stage2_sample_count),
+        ("stage2_virtual_steps", stage2_virtual_steps),
+        ("stage3_virtual_steps", stage3_virtual_steps),
+    )
+    _missing = [n for n, v in _required_floats + _required_ints if v is None]
+    if _missing:
+        raise ValueError(
+            "train_all: the following hyperparameters are None: "
+            + ", ".join(_missing)
+            + ". Set them explicitly in experiments/train4<dataset>.py inside _build_config()."
+        )
+
+    lr_actor = float(lr_actor)
+    lr_critic = float(lr_critic)
+    sparsity_weight = float(sparsity_weight)
+    stage1_sample_count = int(stage1_sample_count)
+    stage2_sample_count = int(stage2_sample_count)
+    stage2_virtual_steps = int(stage2_virtual_steps)
+    lambda2 = float(lambda2)
+    stage3_virtual_steps = int(stage3_virtual_steps)
+    stage3_prune_ratio = float(stage3_prune_ratio)
+    lock_threshold = float(lock_threshold)
+    temperature = float(temperature)
+    epn_dropout = float(epn_dropout)
+    critic_weight_decay = float(critic_weight_decay)
 
     SEED = 888
     random.seed(SEED)
@@ -1883,6 +2009,11 @@ async def train_all(
     PromptTokens.instance().reset()
     CompletionTokens.instance().reset()
 
+    if not llm_name or not str(llm_name).strip():
+        raise ValueError("train_all: llm_name is empty; set it in train4 _build_config().")
+    if agent_names is None:
+        agent_names = ["AnalyzeAgent"] * 5
+
     actor = Actor(
         domain=domain,
         llm_name=llm_name,
@@ -1893,78 +2024,59 @@ async def train_all(
         initial_spatial_probability=0.5,
         node_kwargs=node_kwargs,
     )
+    if epn_dims is None:
+        epn_dims = [epn_concat_input_dim()] + epn_head_hidden_sizes()
+    
     critics = Critics(
-        epn_dims=resolved_epn_dims,
-        lock_threshold=lock_threshold,  # lower = harder to lock, needs more training
-        temperature=temperature,  # from args; train/eval use same value
-        dropout=epn_dropout,  # EPN dropout for regularization
+        epn_dims=epn_dims,
+        lock_threshold=lock_threshold,  # 降低阈值，更难锁定，需要更充分训练
+        temperature=temperature,  # 使用参数传入的temperature，确保训练和评估一致
+        dropout=epn_dropout,  # 添加dropout防止过拟合
     )
     encoder = Encoder()
 
-    # Training uses train split; test/val only for evaluation (avoid test-set leakage)
-    # Applied for: aqua/gsm8k/mmlu/multiarith/svamp
+    def _max_samples_kw(n: Optional[int]) -> Dict[str, Any]:
+        return {} if n is None else {"max_samples": n}
+
+    def _gsm8k_seed_kw() -> Dict[str, Any]:
+        return {} if gsm8k_shuffle_seed is None else {"seed": int(gsm8k_shuffle_seed)}
+
     if domain == "aqua":
         from dataset.aqua_dataset import AQuADataset
-        # AQuADataset: val -> dev.jsonl, test -> test.jsonl (disjoint files; do not merge splits).
-        train_kw: Dict[str, Any] = {}
-        if train_split_max_records is not None:
-            train_kw["max_samples"] = train_split_max_records
-        eval_kw: Dict[str, Any] = {}
-        if eval_split_max_records is not None:
-            eval_kw["max_samples"] = eval_split_max_records
-        train_dataset = AQuADataset(split="val", **train_kw)
-        test_dataset = AQuADataset(split="test", **eval_kw)
+        # val -> dev.jsonl, test -> test.jsonl
+        train_dataset = AQuADataset(split="val", **_max_samples_kw(max_train_split_samples))
+        test_dataset = AQuADataset(split="test", **_max_samples_kw(max_test_split_samples))
         test_max_samples = 129
     elif domain == "mmlu":
         from experiments.train4mmlu import MMLUDataset
-        train_kw_m: Dict[str, Any] = {}
-        if train_split_max_records is not None:
-            train_kw_m["max_samples"] = train_split_max_records
-        eval_kw_m: Dict[str, Any] = {}
-        if eval_split_max_records is not None:
-            eval_kw_m["max_samples"] = eval_split_max_records
-        train_dataset = MMLUDataset(split="dev", **train_kw_m)
-        test_dataset = MMLUDataset(split="val", **eval_kw_m)
+        train_dataset = MMLUDataset(split="dev", **_max_samples_kw(max_train_split_samples))
+        test_dataset = MMLUDataset(split="val", **_max_samples_kw(max_test_split_samples))
         test_max_samples = 153
     elif domain == "svamp":
         from dataset.svamp_dataset import SvampDataset
-        train_kw_s: Dict[str, Any] = {}
-        if train_split_max_records is not None:
-            train_kw_s["max_samples"] = train_split_max_records
-        eval_kw_s: Dict[str, Any] = {}
-        if eval_split_max_records is not None:
-            eval_kw_s["max_samples"] = eval_split_max_records
-        train_dataset = SvampDataset(split="train", **train_kw_s)
-        test_dataset = SvampDataset(split="test", **eval_kw_s)
+        train_dataset = SvampDataset(split="train", **_max_samples_kw(max_train_split_samples))
+        test_dataset = SvampDataset(split="test", **_max_samples_kw(max_test_split_samples))
         test_max_samples = 121
     elif domain == "multiarith":
         from dataset.multiarith_dataset import MultiArithDataset
-        train_kw_ma: Dict[str, Any] = {}
-        if train_split_max_records is not None:
-            train_kw_ma["max_samples"] = train_split_max_records
-        eval_kw_ma: Dict[str, Any] = {}
-        if eval_split_max_records is not None:
-            eval_kw_ma["max_samples"] = eval_split_max_records
-        train_dataset = MultiArithDataset(split="train", **train_kw_ma)
-        test_dataset = MultiArithDataset(split="test", **eval_kw_ma)
+        train_dataset = MultiArithDataset(split="train", **_max_samples_kw(max_train_split_samples))
+        test_dataset = MultiArithDataset(split="test", **_max_samples_kw(max_test_split_samples))
         test_max_samples = 121
     elif domain == "gsm8k":
         from experiments.train4gms8k import GSM8KDataset
-        gseed = int(gsm8k_shuffle_seed) if gsm8k_shuffle_seed is not None else 888
-        train_kw_g: Dict[str, Any] = {"seed": gseed}
-        eval_kw_g: Dict[str, Any] = {"seed": gseed}
-        if train_split_max_records is not None:
-            train_kw_g["max_samples"] = train_split_max_records
-        if eval_split_max_records is not None:
-            eval_kw_g["max_samples"] = eval_split_max_records
-        train_dataset = GSM8KDataset(split="train", **train_kw_g)
-        test_dataset = GSM8KDataset(split="test", **eval_kw_g)
+        _gkw = _gsm8k_seed_kw()
+        train_dataset = GSM8KDataset(split="train", **_max_samples_kw(max_train_split_samples), **_gkw)
+        test_dataset = GSM8KDataset(split="test", **_max_samples_kw(max_test_split_samples), **_gkw)
         test_max_samples = 157
     else:
         # Default (e.g., HumanEval): strict split separation to avoid leakage.
         train_dataset = HumanEvalDataset(split="train")
         test_dataset = HumanEvalDataset(split="test")
         test_max_samples = 121
+        if max_train_split_samples is not None:
+            train_dataset.records = train_dataset.records[: int(max_train_split_samples)]
+        if max_test_split_samples is not None:
+            test_dataset.records = test_dataset.records[: int(max_test_split_samples)]
     if edge_judge is None:
         if domain == "mmlu":
             edge_judge = TextQEdgeJudge()
@@ -1985,11 +2097,9 @@ async def train_all(
             f"({stage1_sample_count + stage2_sample_count}) exceed available train split size ({train_total_records})."
         )
 
-    # Stage1+Stage2: train split
     stage1_records = train_dataset.records[:stage1_sample_count]
     stage2_records = train_dataset.records[stage1_sample_count: stage1_sample_count + stage2_sample_count]
 
-    # Stage3: eval split capped per dataset config
     stage3_records = test_dataset.records[: min(test_max_samples, test_total_records)]
 
     stage1_count = len(stage1_records)
@@ -2010,25 +2120,17 @@ async def train_all(
             f"test={stage3_count}/{test_total_records})"
         )
 
-    if domain == "gsm8k":
-        print(
-            "[INFO] GSM8K: train split = shuffled jsonl train portion; Stage3 pool = shuffled test "
-            "portion (capped by eval_split_max_records / test_max_samples). No train/test merge."
-        )
-
     actor_params = [actor.spatial_logits]
     actor_temporal_param = getattr(actor, "temporal_logits", None)
     if actor_temporal_param is not None:
         actor_params.append(actor_temporal_param)
     actor_optimizer = optim.Adam(actor_params, lr=lr_actor)
-    # weight_decay on Critic optimizer for regularization
+    # 添加weight_decay防止过拟合
     critic_optimizer = optim.Adam(critics.epn.parameters(), lr=lr_critic, weight_decay=critic_weight_decay)
 
     training_state = TrainingState()
     training_state.reset_token_baseline()
-    
-    
-    # Console output policy: keep minimal per-question progress only.
+
     stage1_stats = await stage1_training(
         critics=critics,
         actor=actor,
@@ -2041,6 +2143,8 @@ async def train_all(
         num_rounds=num_rounds,
         sparsity_weight=sparsity_weight,
         training_state=training_state,
+        show_timing=show_timing,
+        show_progress=show_progress,
     )
 
     # Suppress stage summaries to keep output minimal.
@@ -2058,60 +2162,15 @@ async def train_all(
         virtual_steps_per_sample=stage2_virtual_steps,
         lambda2=lambda2,
         training_state=training_state,
+        show_timing=show_timing,
+        show_progress=show_progress,
     )
-
-    # Suppress stage summaries to keep output minimal.
-
-    # loss_curves JSON written after Stage2 edge-level Pearson r (includes epn_edge_level)
-
-    # ===== Train-set edge-level Pearson r (Stage2 real_execution, pooled edges) =====
-    try:
-        y_true = np.asarray(stage2_stats.get("train_target_values", []), dtype=np.float32)
-        y_pred = np.asarray(stage2_stats.get("train_pred_values", []), dtype=np.float32)
-        n = int(y_true.size)
-        if n < 2 or y_true.shape != y_pred.shape:
-            pearson_r = 0.0
-        elif float(np.std(y_true)) > 1e-8 and float(np.std(y_pred)) > 1e-8:
-            pearson_r = float(np.corrcoef(y_true, y_pred)[0, 1])
-        else:
-            pearson_r = 0.0
-        stage2_stats["train_pearson_r"] = pearson_r
-    except Exception as e:
-        print(f"  WARNING: failed to compute train Pearson r: {e}")
-
-    # ===== Save loss curves JSON (after edge metrics merged into stage2_stats) =====
-    try:
-        import json
-
-        os.makedirs("artifacts", exist_ok=True)
-        loss_curves_path = os.path.join("artifacts", f"loss_curves_{dataset_name}.json")
-        loss_payload = {
-            "stage1": {
-                "actor_loss": stage1_stats.get("actor_loss", []),
-                "critic_loss": stage1_stats.get("critic_loss", []),
-                "accuracy": stage1_stats.get("accuracy", []),
-            },
-            "stage2": {
-                "virtual_actor_loss": stage2_stats.get("virtual_actor_loss", []),
-                "real_actor_loss": stage2_stats.get("real_actor_loss", []),
-                "real_critic_loss": stage2_stats.get("real_critic_loss", []),
-                "accuracy": stage2_stats.get("accuracy", []),
-                "epn_edge_level": {
-                    "pearson_r": stage2_stats.get("train_pearson_r"),
-                },
-            },
-        }
-        with open(loss_curves_path, "w", encoding="utf-8") as f:
-            json.dump(loss_payload, f, ensure_ascii=False, indent=2)
-        print(f"\n[Info] Saved loss curves to {loss_curves_path}")
-    except Exception as e:
-        print(f"\n[Warning] Failed to save loss curves JSON: {e}")
 
     if stage2_count > 0:
         print("\n  Stage2 edge-weight snapshot (printed once):")
         _print_actor_edge_info([], actor)
 
-    # After Stage2: lock CEPN (frozen copy); virtual steps and Stage3 use the locked EPN
+    # Stage2 结束后即锁定 CEPN（冻结快照 + 不再训练主 EPN）；后续虚拟步与 Stage3 均使用锁定副本。
     if not critics.is_locked:
         critics.lock_critic()
 
@@ -2119,6 +2178,28 @@ async def train_all(
     temporal_snapshot = (
         actor_temporal_param.detach().clone().cpu() if actor_temporal_param is not None else None
     )
+    logits_path = stage2_logit_path or DEFAULT_STAGE2_LOGITS_PATH
+    os.makedirs(os.path.dirname(logits_path), exist_ok=True)
+    
+    # Save Actor logits and minimal required config (do not export network-architecture hyperparameters).
+    checkpoint_data = {
+        "spatial_logits": spatial_snapshot,
+        "temporal_logits": temporal_snapshot,
+        "critics_is_locked": critics.is_locked,
+    }
+    
+    # If Critics is locked, also save its state to a separate file.
+    if critics.is_locked:
+        critics_path = logits_path.replace(".pt", "_critics.pt")
+        try:
+            critics.save(critics_path)
+            checkpoint_data["critics_path"] = critics_path
+            print(f"Critics state saved: {critics_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save Critics state: {e}")
+    
+    torch.save(checkpoint_data, logits_path)
+    print(f"\nStage2 logits saved: {logits_path}")
 
     # Fully skip Stage 3 when stage3_virtual_steps=0.
     if stage3_virtual_steps == 0:
@@ -2141,7 +2222,7 @@ async def train_all(
             "stage3_total": 0,
         }
     else:
-        # Run full Stage 3
+        # 运行完整的 Stage 3
         stage3_actor = copy.deepcopy(actor)
         with torch.no_grad():
             stage3_actor.spatial_logits.copy_(spatial_snapshot.to(stage3_actor.spatial_logits.device))
@@ -2185,13 +2266,11 @@ async def train_all(
             stage3_temporal_masks_snapshot=stage3_temporal_masks_snapshot,
             stage3_spatial_logits_snapshot=stage3_spatial_logits_snapshot,
             stage3_temporal_logits_snapshot=stage3_temporal_logits_snapshot,
+            show_timing=show_timing,
+            show_progress=show_progress,
             dataset_name=dataset_name,
         )
 
-    # keep console output minimal; suppress final summary prints
-
-    # ===== Save Stage3 eval MSE / Critic curves JSON (after stage3_stats exists) =====
-    # MSE is per-sample mean over edges; training already appends to the same file; rewrite final state
     try:
         import json
 
@@ -2208,37 +2287,21 @@ async def train_all(
             "stage3_mse_le_threshold": float(STAGE3_MSE_LOW_THRESHOLD),
             "stage3_mse_count_le_threshold": n_le_json,
             "stage3_mse_total": n_tot_json,
-            "stage3_epn_edge_level": {
-                "pearson_r": stage3_stats.get("stage3_pearson_r")
-                if isinstance(stage3_stats, dict)
-                else None,
-                "spearman_r": stage3_stats.get("stage3_spearman_r")
-                if isinstance(stage3_stats, dict)
-                else None,
-                "spearman_pvalue": stage3_stats.get("stage3_spearman_pvalue")
-                if isinstance(stage3_stats, dict)
-                else None,
-                "r2": stage3_stats.get("stage3_r2") if isinstance(stage3_stats, dict) else None,
-                "mse_pooled": stage3_stats.get("stage3_mse_pooled")
-                if isinstance(stage3_stats, dict)
-                else None,
-                "n_edges": stage3_stats.get("stage3_n_edges_pooled")
-                if isinstance(stage3_stats, dict)
-                else None,
-            },
         }
         if n_tot_json > 0:
             stage3_mse_payload["stage3_mse_fraction_le_threshold"] = n_le_json / float(n_tot_json)
         with open(stage3_mse_path, "w", encoding="utf-8") as f:
             json.dump(stage3_mse_payload, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"\n[Warning] Failed to save Stage3 MSE curve JSON: {e}")
+        print()
+
 
     prompt_tokens, completion_tokens, total_tokens = training_state.get_token_stats()
     return {
         "stage1": stage1_stats,
         "stage2": stage2_stats,
         "stage3": stage3_stats,
+        "logits_path": logits_path,
         "actor": actor,
         "critics": critics,
         "stage3_actor": stage3_actor,

@@ -38,6 +38,7 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "epn_dropout": None,
         "critic_weight_decay": None,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
+        "stage2_logit_path": train_base.DEFAULT_STAGE2_LOGITS,
         "dataset_split": "dev",
         "max_training_samples": 40,
         "max_validation_samples": 153,
@@ -249,8 +250,8 @@ async def train_mmlu_with_stage3_stats(**config) -> Dict[str, Any]:
 
     result = await train_base.train_all(
         **config,
-        train_split_max_records=max_train,
-        eval_split_max_records=max_eval,
+        max_train_split_samples=max_train,
+        max_test_split_samples=max_eval,
     )
 
 

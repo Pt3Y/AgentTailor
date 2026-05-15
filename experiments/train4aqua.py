@@ -11,40 +11,37 @@ if str(_project_root) not in sys.path:
 
 from experiments import train_base
 
-
 def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
     config: Dict[str, Any] = {
         "agent_names": ["MathSolver"] * 5,
-        "llm_name": "gpt-4o",
+        "llm_name": "BlueShirtChat",
         "decision_method": "FinalRefer",
         "optimized_spatial": True,
         "optimized_temporal": True,
         "domain": "aqua",
         "num_rounds": 2,
-        "lr_actor": None,
-        "lr_critic": None,
-        "sparsity_weight": None,
-        "stage1_sample_count": None,
-        "stage2_sample_count": None,
-        "stage2_virtual_steps": None,
-        "lambda2": None,
-        "lambda3": None,
-        "stage3_virtual_steps": None,
-        "stage3_prune_ratio": None,
-        "lock_threshold": None,
-        "temperature": None,
-        "epn_dropout": None,
-        "critic_weight_decay": None,
+        "lr_actor": 0.04,
+        "lr_critic": 2e-3,
+        "sparsity_weight": 0.0,
+        "stage1_sample_count": 10,
+        "stage2_sample_count": 30,
+        "stage2_virtual_steps": 4,
+        "lambda2": 0.02,
+        "lambda3": 0.04,
+        "stage3_virtual_steps": 5,
+        "stage3_prune_ratio": 0.25,
+        "lock_threshold": 0.001,
+        "temperature": 1.0,
+        "epn_dropout": 0.1,
+        "critic_weight_decay": 0.01,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
-        # Caps apply per file: dev.jsonl (train) vs test.jsonl (eval) — disjoint, no merge.
+        "stage2_logit_path": train_base.DEFAULT_STAGE2_LOGITS,
         "max_training_samples": 40,
         "max_validation_samples": 129,
     }
     if overrides:
         config.update(overrides)
     return config
-
-
 import asyncio
 import random
 import time
@@ -68,8 +65,8 @@ async def train_aqua_with_stage3_stats(**config: Any) -> Dict[str, Any]:
     config.pop("validation_split", None)
     return await train_base.train_all(
         **config,
-        train_split_max_records=max_train,
-        eval_split_max_records=max_eval,
+        max_train_split_samples=max_train,
+        max_test_split_samples=max_eval,
     )
 
 
