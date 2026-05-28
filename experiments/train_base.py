@@ -34,10 +34,6 @@ from experiments_util.edge_utils import prepare_edge_inputs
 from AgentTailor.utils.globals import PromptTokens, CompletionTokens, Cost, ApiCalls
 device = "cuda" if torch.cuda.is_available() else "cpu"
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-ARTIFACTS_DIR = os.path.join(PROJECT_ROOT, "artifacts")
-DEFAULT_STAGE2_LOGITS_PATH = os.path.join(ARTIFACTS_DIR, "train11_stage2_logits.pt")
-# Shorter alias used by train4 *_build_config (same path as DEFAULT_STAGE2_LOGITS_PATH).
-DEFAULT_STAGE2_LOGITS = DEFAULT_STAGE2_LOGITS_PATH
 
 
 def epn_concat_input_dim(n_segments: int = 5, embed_dim: int = 384) -> int:
@@ -414,22 +410,6 @@ def _critic_loss_from_batch(
     )
     return critic_loss
 
-
-def _persist_stage3_curves_json(dataset_name: str, stats: Dict[str, Any]) -> None:
-    """将 Stage3 的 MSE 与 Critic 记录损失曲线写入 artifacts（供中断后仍保留已跑样本）。"""
-    import json
-
-    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-    path = os.path.join(ARTIFACTS_DIR, f"stage3_mse_curve_{dataset_name}.json")
-    mse_list = stats.get("stage3_mse", []) if isinstance(stats, dict) else []
-    cl_list = stats.get("stage3_critic_loss", []) if isinstance(stats, dict) else []
-    payload = {
-        "dataset": dataset_name,
-        "stage3_mse": list(mse_list),
-        "stage3_critic_loss": list(cl_list),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 STAGE3_MSE_LOW_THRESHOLD = 0.015
 
@@ -1729,7 +1709,6 @@ async def stage3_training(
         stage3_temporal_logits_snapshot: Optional[torch.Tensor] = None,
         show_timing: bool = True,
         show_progress: bool = True,
-        dataset_name: str = "",
 ) -> Dict[str, List[float]]:
     if stage3_virtual_steps is None:
         stage3_virtual_steps = 0
@@ -1820,8 +1799,6 @@ async def stage3_training(
             if y_true.size > 0 and y_true.shape == y_pred.shape:
                 stats["stage3_pred_values"].extend(y_pred.tolist())
                 stats["stage3_target_values"].extend(y_true.tolist())
-            if dataset_name:
-                _persist_stage3_curves_json(dataset_name, stats)
 
             _print_question_progress(
                 "Stage3",
@@ -1850,9 +1827,6 @@ async def stage3_training(
             stats["accuracy"].append(0.0)
             stats["stage3_mse"].append(0.0)
             stats["stage3_critic_loss"].append(0.0)
-            if dataset_name:
-                _persist_stage3_curves_json(dataset_name, stats)
-
 
         # suppress periodic progress logs
 
@@ -1937,7 +1911,6 @@ async def train_all(
         lambda2: Optional[float] = None,
         lambda3: Optional[float] = None,
         edge_judge: Optional[EdgeJudge] = None,
-        stage2_logit_path: Optional[str] = None,
         stage3_virtual_steps: Optional[int] = None,
         stage3_prune_ratio: Optional[float] = None,
         node_kwargs: Optional[List[Dict[str, Any]]] = None,
@@ -2178,28 +2151,6 @@ async def train_all(
     temporal_snapshot = (
         actor_temporal_param.detach().clone().cpu() if actor_temporal_param is not None else None
     )
-    logits_path = stage2_logit_path or DEFAULT_STAGE2_LOGITS_PATH
-    os.makedirs(os.path.dirname(logits_path), exist_ok=True)
-    
-    # Save Actor logits and minimal required config (do not export network-architecture hyperparameters).
-    checkpoint_data = {
-        "spatial_logits": spatial_snapshot,
-        "temporal_logits": temporal_snapshot,
-        "critics_is_locked": critics.is_locked,
-    }
-    
-    # If Critics is locked, also save its state to a separate file.
-    if critics.is_locked:
-        critics_path = logits_path.replace(".pt", "_critics.pt")
-        try:
-            critics.save(critics_path)
-            checkpoint_data["critics_path"] = critics_path
-            print(f"Critics state saved: {critics_path}")
-        except Exception as e:
-            print(f"Warning: Failed to save Critics state: {e}")
-    
-    torch.save(checkpoint_data, logits_path)
-    print(f"\nStage2 logits saved: {logits_path}")
 
     # Fully skip Stage 3 when stage3_virtual_steps=0.
     if stage3_virtual_steps == 0:
@@ -2268,40 +2219,13 @@ async def train_all(
             stage3_temporal_logits_snapshot=stage3_temporal_logits_snapshot,
             show_timing=show_timing,
             show_progress=show_progress,
-            dataset_name=dataset_name,
         )
-
-    try:
-        import json
-
-        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-        stage3_mse_path = os.path.join(ARTIFACTS_DIR, f"stage3_mse_curve_{dataset_name}.json")
-        mse_for_json = stage3_stats.get("stage3_mse", []) if isinstance(stage3_stats, dict) else []
-        n_le_json, n_tot_json = _stage3_mse_low_count(mse_for_json)
-        stage3_mse_payload: Dict[str, Any] = {
-            "dataset": dataset_name,
-            "stage3_mse": mse_for_json,
-            "stage3_critic_loss": stage3_stats.get("stage3_critic_loss", [])
-            if isinstance(stage3_stats, dict)
-            else [],
-            "stage3_mse_le_threshold": float(STAGE3_MSE_LOW_THRESHOLD),
-            "stage3_mse_count_le_threshold": n_le_json,
-            "stage3_mse_total": n_tot_json,
-        }
-        if n_tot_json > 0:
-            stage3_mse_payload["stage3_mse_fraction_le_threshold"] = n_le_json / float(n_tot_json)
-        with open(stage3_mse_path, "w", encoding="utf-8") as f:
-            json.dump(stage3_mse_payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print()
-
 
     prompt_tokens, completion_tokens, total_tokens = training_state.get_token_stats()
     return {
         "stage1": stage1_stats,
         "stage2": stage2_stats,
         "stage3": stage3_stats,
-        "logits_path": logits_path,
         "actor": actor,
         "critics": critics,
         "stage3_actor": stage3_actor,

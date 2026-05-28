@@ -38,7 +38,6 @@ def _build_config(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "epn_dropout": None,
         "critic_weight_decay": None,
         "epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
-        "stage2_logit_path": train_base.DEFAULT_STAGE2_LOGITS,
         "dataset_split": "dev",
         "max_training_samples": 40,
         "max_validation_samples": 153,

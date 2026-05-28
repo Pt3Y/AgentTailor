@@ -1,141 +1,205 @@
 # AgentTailor (experiment fork)
 
-This repository is an experimental fork focused on **training / ablation** around the AgentTailor-style multi-agent graph (spatial + temporal structure, critics, staged training). Core network and experiment code live under `AgentTailor/` and `experiments/`.
+Experimental fork for **multi-agent graphs** (spatial + temporal edges), **Critics (EPN)**, and **staged training**. Core code lives under `AgentTailor/` and `experiments/`.
 
+After you complete the steps below, run training from the **repository root**:
+
+```bash
+python experiments/train4gms8k.py
+```
 ---
 
 ## Repository layout
 
 | Path | Role |
 |------|------|
-| `AgentTailor/ATNetwork/` | Actor, critics, nodes, replay / interaction |
+| `AgentTailor/ATNetwork/` | Actor, Critics, nodes, edge judges |
 | `AgentTailor/agents/`, `prompt/`, `llm/` | Agent roles, prompts, LLM adapters |
 | `experiments/` | Entry scripts (`train4*.py`) and `train_base.py` |
-| `dataset/` | Datasets and loaders (AQuA, GSM8K, MMLU, HumanEval, etc.) |
-| `experiments_util/` | Judges, loaders, helpers for experiments |
-| `.env.template` | **API only**: copy to `.env` and set keys / base URLs for your LLM provider |
-
-Generated runs, caches, and local secrets should stay out of git (see `.gitignore`).
+| `dataset/` | Benchmark data and loaders |
+| `experiments_util/` | Judges and experiment helpers |
+| `.env.template` |  — copy to `.env` |
 
 ---
 
-## Quick start
+## Quick start (executable checklist)
 
-**1. Fill hyperparameters and (optionally) network fields in `_build_config()`**  
+### 1. Environment
 
-Open the domain script under `experiments/` (e.g. `train4aqua.py`) and edit the dict returned by **`_build_config()`**. See [Filling in hyperparameters](#filling-in-hyperparameters) and [Adjusting network structure](#adjusting-network-structure) below.
-
-**2. Python** 3.10+ recommended.
-
-**3. Install dependencies**
+- **Python** 3.10+ (3.10 or 3.11 recommended).
+- Run all commands from the **repository root** (entry scripts add the project root to `sys.path`).
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**4. API credentials (`.env` — not training hyperparameters)**  
+The first run downloads `sentence-transformers` encoder weights; you need network access or a configured mirror.
 
-Copy `.env.template` to `.env` and set only what your LLM client needs, for example:
+### 2. API credentials (`.env`)
 
-- `OPENAI_API` (and `OPENAI_BASE_URL` if you use a proxy or compatible gateway)  
-- or `DEEPSEEK_*` variables if you use that stack  
-
-Do **not** put learning rates, sample counts, or other training knobs in `.env`; put them in `_build_config()` as above.
-
-**5. Run an experiment** (from the repo root), e.g.:
+Copy the template and fill in keys for your backend. 
 
 ```bash
-python experiments/train4aqua.py
+# Linux / macOS
+cp .env.template .env
+
+# Windows (PowerShell)
+Copy-Item .env.template .env
 ```
 
-Other entry points: `train4gms8k.py`, `train4humaneval.py`, `train4mmlu.py`, `train4multiarith.py`, `train4svamp.py`.
+| Backend | Variables | `_build_config()` |
+|---------|-----------|-------------------|
+| OpenAI-compatible | `OPENAI_API_KEY` or `OPENAI_API`; `OPENAI_BASE_URL` if using a proxy/gateway | `llm_name`: any model id string (e.g. `"gpt-4o"`) → `GPTChat` |
+| DeepSeek | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` | `llm_name`: `"DeepSeekChat"` |
 
-Each script builds a dict with `_build_config()` and calls `train_base.train_all(**...)` — use **keyword unpacking** (wrappers may `pop()` extra keys such as dataset caps before calling `train_all`).
+Resolution logic is in `AgentTailor/llm/llm_registry.py`.
+
+### 3. Data files
+
+Confirm files exist **before** running the matching entry script:
+
+| `domain` | Entry script | Required paths (from repo root) |
+|----------|--------------|--------------------------------|
+| `gsm8k` | `train4gms8k.py` | `dataset/gsm8k/gsm8k.jsonl` (included) |
+| `aqua` | `train4aqua.py` | `dataset/aqua/dev.jsonl`, `dataset/aqua/test.jsonl` (included) |
+| `svamp` | `train4svamp.py` | `dataset/Svamp/train.json`, `dataset/Svamp/test.json` (included) |
+| `multiarith` | `train4multiarith.py` | `dataset/MultiArith/train.json`, `dataset/MultiArith/test.json` (included) |
+| `humaneval` | `train4humaneval.py` | `dataset/humaneval/humaneval-py.jsonl`|
+| `mmlu` | `train4mmlu.py` | Run `dataset/MMLU/download.py` first |
+
+**Suggested first run:** `train4gms8k.py` or `train4svamp.py` (data already in the repo).
+
+### 4. Hyperparameters (required)
+
+Each `experiments/train4*.py` ships with training hyperparameters set to `None`. 
+Open the entry script you plan to run and replace every `None` training field in **`_build_config()`** with explicit values. Field names and roles are listed in [Hyperparameter reference](#hyperparameter-reference); match `domain` and `agent_names` to the [entry script table](#entry-scripts-and-domain).
+
+Constraints:
+
+- `stage1_sample_count + stage2_sample_count` ≤ training split size (after any `max_training_samples` cap).
+- `stage3_virtual_steps == 0` skips Stage3 inside `train_all` (no extra LLM eval loop there).
+- `lambda3` may stay `None` (optional adaptive actor LR during real steps).
+
+### 5. Run
+
+```bash
+python experiments/train4gms8k.py
+```
+
+Other entries: `train4aqua.py`, `train4humaneval.py`, `train4mmlu.py`, `train4multiarith.py`, `train4svamp.py`.
 
 ---
 
-## Filling in hyperparameters
+## Entry scripts and `domain`
 
-**Where:** only inside `experiments/train4<domain>.py` → **`_build_config()`** (plus optional `overrides` if you use that pattern).
+`train_all()` selects datasets and edge judges from `domain`. It **must** match the script you run.
 
-**Rule:** `train_base.train_all()` **does not** read training hyperparameters from environment variables. Required numeric fields must be **explicit numbers** (not `None`), or `train_all` will raise `ValueError` listing what is missing.
+| Script | Set `"domain"` to | Typical `agent_names` |
+|--------|-------------------|------------------------|
+| `train4humaneval.py` | `humaneval` | `["CodeWriting"] * 5` |
+| `train4aqua.py` | **`aqua`** | `MathSolver` + `AnalyzeAgent`, etc. |
+| `train4gms8k.py` | `gsm8k` | `MathSolver` + `AnalyzeAgent`, etc. |
+| `train4svamp.py` | `svamp` | `["MathSolver"] * 5` |
+| `train4multiarith.py` | `multiarith` | math agents |
+| `train4mmlu.py` | `mmlu` | `["AnalyzeAgent"] * 5`, etc. |
 
-**Typical workflow**
 
-1. Pick the entry script for your benchmark (`train4aqua.py`, …).  
-2. Copy an existing `_build_config()` from another script if you want a template, then change domain-specific keys (`domain`, `llm_name`, caps).  
-3. Ensure **every** row in the table below that applies to your run is set (same names as `train_all` keyword arguments).  
-4. Keep **`stage1_sample_count + stage2_sample_count` ≤ size of the training split** after caps (otherwise `train_all` raises).  
-5. Set **`lambda3`** only if you want adaptive actor LR during real steps; otherwise use `None`.
+Registered agent names (must appear in `AgentRegistry`): `MathSolver`, `AnalyzeAgent`, `CodeWriting`, `AdverarialAgent`, `FinalRefer`, `FinalWriteCode`, `FinalDirect`, `FinalMajorVote`.
+
+---
+
+
+`train4gms8k.py` additionally accepts `gsm8k_shuffle_seed` (default `888` in the template) for shuffling `gsm8k.jsonl` before train/val/test slices.
+
+---
+
+## Training pipeline (in memory)
+
+1. **Stage 1** — `real_execution` on the first `stage1_sample_count` training records; trains Actor and Critic.
+2. **Stage 2** — on the next `stage2_sample_count` records: `virtual_execution` × `stage2_virtual_steps`, then `real_execution` per record.
+3. **After Stage 2** — `critics.lock_critic()` freezes the EPN snapshot for virtual steps and Stage3.
+4. **Stage 3** (only if `stage3_virtual_steps != 0`) — `copy.deepcopy(actor)` and `copy.deepcopy(critics)`; Stage2 spatial/temporal logits are copied into `stage3_actor`; evaluation runs on the test split inside `train_all`.
+
+Metrics are returned from `train_all` and printed by each entry script.
+
+---
+
+## Hyperparameter reference
+
+**Location:** only `experiments/train4<domain>.py` → `_build_config()` (optional `overrides` dict).
+
+**Rule:** `train_all()` does **not** read training hyperparameters from environment variables. Listed fields must be explicit numbers, not `None`.
 
 | Key | Role |
 |-----|------|
-| `agent_names` | List of agent role names, length = number of nodes (e.g. five `MathSolver` for math scripts). Must match entries usable by `Actor`. |
-| `llm_name` | Backend model id / registry name your `llm` layer resolves (e.g. OpenAI or custom chat class). |
-| `decision_method` | How the graph aggregates multi-agent output (e.g. `FinalRefer`). |
-| `num_rounds` | Multi-round dialogue depth inside the actor per sample. |
-| `lr_actor`, `lr_critic` | Adam learning rates for actor logits vs critic (EPN). |
-| `sparsity_weight` | Weight for sparsity / structure regularization in policy loss. |
-| `stage1_sample_count`, `stage2_sample_count` | How many training-split records are used in Stage 1 vs Stage 2. |
-| `stage2_virtual_steps` | Virtual gradient steps **per** Stage-2 record. |
-| `lambda2` | Mixing / scaling for Stage-2 virtual loss (see `virtual_execution` in `train_base.py`). |
-| `lambda3` | Optional: scales actor LR with running accuracy when non-`None`. |
-| `stage3_virtual_steps` | Set to `0` to skip Stage 3 evaluation loop entirely. |
-| `stage3_prune_ratio` | Fraction of weak edges pruned before Stage 3 (when enabled in pipeline). |
-| `lock_threshold`, `temperature`, `epn_dropout` | Critic (EPN) locking sharpness, softmax temperature, dropout. |
-| `critic_weight_decay` | Adam `weight_decay` on critic parameters. |
-| `epn_dims` | MLP shape for the critic head — see [Adjusting network structure](#adjusting-network-structure). |
-| `stage2_logit_path` | Where Stage-2 actor logits (and optional critic file) are saved; default via `train_base.DEFAULT_STAGE2_LOGITS`. |
-| `max_training_samples`, `max_validation_samples` | Optional caps on train / eval splits (wrappers pass these as `max_train_split_samples` / `max_test_split_samples`). |
-| `gsm8k_shuffle_seed` | (`train4gms8k.py` only) RNG seed for shuffling the single JSONL before train/val/test slices. |
+| `agent_names` | Agent class per node; length = node count |
+| `llm_name` | Model id or `DeepSeekChat` |
+| `decision_method` | Aggregation node, e.g. `FinalRefer` |
+| `domain` | Dataset keyword (see table above) |
+| `optimized_spatial` / `optimized_temporal` | Train spatial / temporal edge logits |
+| `num_rounds` | Actor dialogue rounds per sample |
+| `lr_actor`, `lr_critic` | Adam learning rates |
+| `sparsity_weight` | Sparsity term in policy loss |
+| `stage1_sample_count`, `stage2_sample_count` | Training records per stage |
+| `stage2_virtual_steps` | Virtual gradient steps per Stage2 record |
+| `lambda2` | Stage2 virtual-step LR scaling (`virtual_execution`) |
+| `lambda3` | Optional; scales actor LR with running accuracy when set |
+| `stage3_virtual_steps` | `0` = skip Stage3 in `train_all`; `> 0` = run Stage3 eval loop |
+| `stage3_prune_ratio` | Weak-edge prune ratio before Stage3 |
+| `lock_threshold`, `temperature`, `epn_dropout` | Critic lock threshold, EPN tanh scale, dropout |
+| `critic_weight_decay` | Adam `weight_decay` on critic parameters |
+| `epn_dims` | EPN MLP shape (see below) |
+| `gsm8k_shuffle_seed` | `train4gms8k.py` only — shuffle seed for `gsm8k.jsonl` |
 
 ---
 
-## Adjusting network structure
+## Network structure
 
-Most graph / architecture choices are **also** in `_build_config()` because they are passed straight into `train_all` → `Actor` / `Critics`.
-
-### Multi-agent graph (Actor)
+### Actor graph
 
 | Key | Effect |
 |-----|--------|
-| `agent_names` | Which agent classes are instantiated at each node. Changing length changes **node count**; keep consistent with prompts and edge templates in `AgentTailor`. |
-| `optimized_spatial` | If `True`, actor maintains **trainable spatial edge logits / masks** among agents. |
-| `optimized_temporal` | If `True`, same for **temporal** (round-to-round) edges. Turning one off fixes that part of the graph to a simpler pattern (see `Actor` construction). |
-| `num_rounds` | More rounds = deeper temporal messaging per task (more LLM cost). |
+| `agent_names` | Which agent classes instantiate each node |
+| `optimized_spatial` | Learnable spatial edge logits |
+| `optimized_temporal` | Learnable temporal edge logits |
+| `num_rounds` | More rounds → deeper temporal messaging (higher API cost) |
 
-For behavior beyond names (tool use, prompts), inspect `AgentTailor/ATNetwork/Actor.py`, `AgentTailor/agents/`, and `AgentTailor/prompt/`.
+See `AgentTailor/ATNetwork/Actor.py`, `AgentTailor/agents/`, `AgentTailor/prompt/`.
 
-### Critic (EPN) MLP width — `epn_dims`
+### Critic (EPN) — `epn_dims`
 
-`Critics` in `AgentTailor/ATNetwork/Critics.py` expects `epn_dims` to be a list `[input_dim, hidden…, 1]`: the **first** element must match the **concatenated encoder width** fed into the critic (default setup: one vector per edge segment).
+`Critics` expects `epn_dims = [input_dim, hidden…, 1]` where `input_dim` matches the concatenated encoder width.
 
 Helpers in `experiments/train_base.py`:
 
-- **`epn_concat_input_dim(n_segments=5, embed_dim=384)`** — default assumes **5 segments × 384 dims** (MiniLM-L6-v2–style encoder).  
-- **`epn_head_hidden_sizes()`** — returns **`[1]`**, i.e. one hidden width of `1` before the scalar head (you may replace with e.g. `[64, 1]` if you change `Critics` to match).
+- `epn_concat_input_dim(n_segments=5, embed_dim=384)` — default 5 segments × 384 (MiniLM-L6-v2 style).
+- `epn_head_hidden_sizes()` — default `[1]`.
 
-**Recommended pattern in `_build_config()`:**
-
-```python
-"epn_dims": [train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes(),
-```
-
-If you change the encoder output size or segment count in `Actor` / `Encoder`, update **`n_segments` / `embed_dim`** in `epn_concat_input_dim(...)` so the first dimension of `epn_dims` still matches the actual concatenated feature length; otherwise forward passes will error.
-
-If you omit `epn_dims`, `train_all` fills **`[epn_concat_input_dim()] + epn_head_hidden_sizes()`** automatically — override in `_build_config()` whenever you want a custom head.
+In `_build_config()`, set `epn_dims` to `[train_base.epn_concat_input_dim()] + train_base.epn_head_hidden_sizes()` unless you customize the head. If `epn_dims` is omitted, `train_all` fills the same default. Update `epn_concat_input_dim(...)` if you change encoder output size or segment count.
 
 ### Critic behavior knobs
 
-`lock_threshold`, `temperature`, and `epn_dropout` are passed into **`Critics(...)`** — they control how sharply edges lock, softmax sharpness in edge scoring, and dropout on the EPN. Tune them in `_build_config()` together with `lr_critic` and `critic_weight_decay`.
-
-### Deeper structural edits
-
-If you need new edge types, new encoders, or different tensor shapes, you will edit **`AgentTailor/ATNetwork/`** (especially `Actor.py`, `Critics.py`, `Node.py`) and keep `_build_config()` in sync with any new constructor arguments (you may need to extend `train_all`’s signature and the dict in `train4*.py`).
+`lock_threshold`, `temperature` (EPN output scaling), and `epn_dropout` are passed into `Critics(...)`. Tune them together with `lr_critic` and `critic_weight_decay`.
 
 ---
 
-## Data
+## Troubleshooting
 
-- Some splits ship under `dataset/` (e.g. AQuA JSONL, GSM8K, HumanEval, MultiArith, Svamp).
-- **MMLU** and other large corpora may be missing until you download them; use helpers such as `dataset/MMLU/download.py` and follow any README or comments in that folder.
+| Symptom | Fix |
+|---------|-----|
+| `train_all: the following hyperparameters are None: ...` | Set every listed field in `_build_config()` for that script |
+| `Stage1 + Stage2 samples exceed available train split size` | Lower `stage1_sample_count` / `stage2_sample_count` or raise `max_training_samples` |
+| `Dataset file not found` / `GSM8K data not found` | Add data per [Data files](#3-data-files) or run MMLU download |
+| `unexpected keyword argument 'max_training_samples'` | On `train4humaneval.py`, use `max_train_split_samples` / `max_test_split_samples` instead |
+| Wrong benchmark loaded (e.g. AQuA runs GSM8K logic) | Set `"domain": "aqua"` in `train4aqua.py` |
+| OpenAI 401 / connection errors | Check `.env` keys and `OPENAI_BASE_URL` |
+| Very slow run or high cost | Lower `num_rounds`, sample counts, set `stage3_virtual_steps=0`, reduce `max_*_samples` |
+
+---
+
+## Data notes
+
+- AQuA, GSM8K, Svamp, and MultiArith files are included under `dataset/`.
+- **HumanEval:** place `humaneval-py.jsonl` at `dataset/humaneval/humaneval-py.jsonl`.
+- **MMLU:** download via `dataset/MMLU/download.py` and follow comments in that folder before `train4mmlu.py`.
+
